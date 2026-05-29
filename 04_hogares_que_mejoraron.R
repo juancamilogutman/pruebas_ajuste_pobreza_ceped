@@ -12,7 +12,7 @@ dir.create("outputs")
 base_aj <- read_parquet("bases/eph_ajustada_v2.parquet")
 
 # AGLOMERADO no quedó en la base liviana del 04, lo traemos aparte
-aglo <- open_dataset("bases/eph_combinada_2017_2024") |>
+aglo <- open_dataset("bases/eph_combinada_2016_2025") |>
   select(CODUSU, NRO_HOGAR, ANO4, TRIMESTRE, AGLOMERADO) |>
   distinct(CODUSU, NRO_HOGAR, ANO4, TRIMESTRE, AGLOMERADO) |>
   collect() # no conozco bien esta función

@@ -20,9 +20,9 @@ cols_necesarias <- c(
 )
 
 # abrimos todos los parquets del directorio
-base <- open_dataset("bases/eph_combinada_2017_2024") |>
+base <- open_dataset("bases/eph_combinada_2016_2025") |>
   select(all_of(cols_necesarias)) |>
-  filter(ANO4 %in% 2017:2024) |>
+  filter(ANO4 %in% 2016:2025) |>
   collect()
 
 # replicamos las exclusiones que hace INDEC, es decir,
@@ -34,6 +34,16 @@ base <- base |> filter(
 )
 
 canastas <- read_parquet("bases/canastas_regionales.parquet")
+
+canastas_q <- canastas |>
+  distinct(periodo) |>
+  transmute(ANO4 = as.integer(substr(periodo, 1, 4)),
+            TRIMESTRE = as.integer(substr(periodo, 6, 6)))
+
+filas_pre_canasta <- nrow(base)
+base <- base |> semi_join(canastas_q, by = c("ANO4", "TRIMESTRE")) #porque pueden llegar a haber trimestres sin canasta regional (pero la agregué manualmente)
+message(sprintf("Filas descartadas por falta de canasta: %d",
+                filas_pre_canasta - nrow(base)))
 
 # pobreza original
 base_pov <- calculate_poverty(base, basket = canastas, window = "quarter",
@@ -117,7 +127,7 @@ brecha_long <- read_excel("bases/Estimación brecha ANR_20260416.xlsx", #cortes�
   pivot_longer(-percentil, names_to = "col", values_to = "brecha") |>
   mutate(ANO4 = as.integer(substr(col, 1, 4)),
          metodo = substr(col, 11, 11)) |>
-  filter(metodo == "c", ANO4 %in% 2017:2024) |>
+  filter(metodo == "c", ANO4 %in% 2016:2025) |>
   transmute(ANO4, percentil,
             brecha_aplicada = if_else(brecha > 1, brecha, 1))
 

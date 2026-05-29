@@ -13,15 +13,22 @@ cols_necesarias <- c(
   "PONDERA", "PONDIIO", "PONDII"
 )
 
-base <- open_dataset("bases/eph_combinada_2017_2024") |>
+base <- open_dataset("bases/eph_combinada_2016_2025") |>
   select(all_of(cols_necesarias)) |>
-  filter(ANO4 %in% 2017:2024) |>
+  filter(ANO4 %in% 2016:2025) |>
   # mismas exclusiones de cobertura INDEC (tierra del fuego en un momento de la pandemia, gran resistencia en cierto semestre)
   filter(
     !(ANO4 == 2019 & TRIMESTRE %in% c(3, 4) & AGLOMERADO == 8),
     !(ANO4 == 2020 & TRIMESTRE %in% c(3, 4) & AGLOMERADO == 31)
   ) |>
   collect()
+
+canastas_q <- read_parquet("bases/canastas_regionales.parquet") |>
+  distinct(periodo) |>
+  transmute(ANO4 = as.integer(substr(periodo, 1, 4)),
+            TRIMESTRE = as.integer(substr(periodo, 6, 6)))
+
+base <- base |> semi_join(canastas_q, by = c("ANO4", "TRIMESTRE"))
 
 # armamos el grupo laboral de 10 niveles que mostramos en la app
 base <- base |>
@@ -111,7 +118,7 @@ brecha_long <- read_excel("bases/EstimaciÃ³n brecha ANR_20260416.xlsx", #cortesÃ
   pivot_longer(-percentil, names_to = "col", values_to = "brecha") |>
   mutate(ANO4 = as.integer(substr(col, 1, 4)),
          tipo_eph = substr(col, 11, 11)) |> # el caracter 11 es p o c segun puntual o continua
-  filter(tipo_eph == "c", ANO4 %in% 2017:2024)
+  filter(tipo_eph == "c", ANO4 %in% 2016:2025)
 
 pct_min <- brecha_long |>
   filter(brecha > 1) |>
@@ -143,3 +150,19 @@ umbrales <- ref |>
   select(ANO4, TRIMESTRE, periodo_lbl, pct_min, umbral)
 
 write_parquet(umbrales, "bases/umbrales_brecha_por_trimestre.parquet")
+
+app_data <- "app/data"
+
+if (dir.exists(app_data)) {
+  archivos_app <- c("datos_app_densidades.parquet",
+                    "umbrales_brecha_por_trimestre.parquet",
+                    "hogares_que_mejoraron.parquet",
+                    "pobreza_serie.parquet")
+  for (f in archivos_app) {
+    src <- file.path("bases", f)
+    dst <- file.path(app_data, f)
+    if (file.exists(src)) {
+      file.copy(src, dst, overwrite = TRUE)
+    }
+  }
+}

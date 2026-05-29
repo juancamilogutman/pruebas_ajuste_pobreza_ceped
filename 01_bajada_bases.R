@@ -5,8 +5,8 @@ library(eph)
 library(tidyverse)
 library(arrow)
 
-anio_inicio <- 2017
-anio_fin    <- 2024
+anio_inicio <- 2016
+anio_fin    <- 2025
 trimestres  <- 1:4
 output_dir  <- "bases"
 
@@ -60,6 +60,8 @@ descargar_trimestre <- function(anio, trim) {
 
 for (anio in anio_inicio:anio_fin) {
   for (trim in trimestres) {
+
+    if (anio == 2016 && trim %in% c(1L, 2L)) next
 
     fname <- sprintf("eph_%d_t%d.parquet", anio, trim)
     if (file.exists(file.path(output_dir, fname))) {
@@ -140,6 +142,71 @@ canastas <- tryCatch(
 if (!is.null(canastas)) {
   write_parquet(canastas, file.path(output_dir, "canastas_regionales.parquet"))
   message("Canastas regionales del paquete eph guardadas.")
+}
+
+# extendemos las canastas regionales con el anexo del informe INDEC, porque
+# el cache de holatam/data que usa el paquete eph va con lag y nos perdemos
+# trimestres recientes (ej. S2 2025)
+informe <- file.path(output_dir, "cuadros_informe_pobreza_03_26.xls")
+
+if (!is.null(canastas) && file.exists(informe)) {
+  raw <- suppressMessages(
+    readxl::read_excel(informe, sheet = "Series canastas anexo",
+                       col_names = FALSE, .name_repair = "minimal")
+  )
+
+  anio_extra <- as.integer(raw[[2]][3])
+  meses_es <- c(Enero = 1L, Febrero = 2L, Marzo = 3L, Abril = 4L,
+                Mayo = 5L, Junio = 6L, Julio = 7L, Agosto = 8L,
+                Septiembre = 9L, Octubre = 10L, Noviembre = 11L,
+                Diciembre = 12L)
+  meses_cols <- unname(meses_es[as.character(unlist(raw[4, -1]))])
+
+  mapa_regiones <- tibble::tribble(
+    ~region_xls,         ~region,     ~codigo,
+    "Gran Buenos Aires", "GBA",        1,
+    "Cuyo",              "Cuyo",      42,
+    "Noreste",           "Noreste",   41,
+    "Noroeste",          "Noroeste",  40,
+    "Pampeana",          "Pampeana",  43,
+    "Patagonia",         "Patagonia", 44
+  )
+
+  parse_bloque <- function(filas, nombre) {
+    raw[filas, ] |>
+      setNames(c("region_xls", paste0("m", meses_cols))) |>
+      tidyr::pivot_longer(-region_xls, names_to = "mc",
+                          values_to = "valor") |>
+      mutate(mes = as.integer(sub("^m", "", mc)),
+             valor = as.numeric(valor),
+             TRIMESTRE = (mes - 1L) %/% 3L + 1L) |>
+      group_by(region_xls, TRIMESTRE) |>
+      summarise(n = sum(!is.na(valor)),
+                v = mean(valor, na.rm = TRUE),
+                .groups = "drop") |>
+      filter(n == 3L) |>
+      transmute(region_xls, TRIMESTRE, !!nombre := v)
+  }
+
+  cba_q <- parse_bloque(7:12,  "CBA")
+  cbt_q <- parse_bloque(32:37, "CBT")
+
+  nuevo <- cba_q |>
+    inner_join(cbt_q, by = c("region_xls", "TRIMESTRE")) |>
+    inner_join(mapa_regiones, by = "region_xls") |>
+    mutate(periodo = sprintf("%d.%d", anio_extra, TRIMESTRE)) |>
+    select(region, periodo, CBA, CBT, codigo)
+
+  if (nrow(nuevo) > 0) {
+    canastas_ext <- bind_rows(
+      anti_join(canastas, nuevo, by = c("region", "periodo")),
+      nuevo
+    ) |> arrange(periodo, region)
+    write_parquet(canastas_ext,
+                  file.path(output_dir, "canastas_regionales.parquet"))
+    message(sprintf("Canastas extendidas con %d filas del informe INDEC (%s)",
+                    nrow(nuevo), basename(informe)))
+  }
 }
 
 message("Proceso finalizado.")
