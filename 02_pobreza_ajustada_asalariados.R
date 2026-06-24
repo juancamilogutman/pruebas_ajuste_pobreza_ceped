@@ -20,9 +20,9 @@ cols_necesarias <- c(
 )
 
 # abrimos todos los parquets del directorio
-base <- open_dataset("bases/eph_combinada_2016_2025") |>
+base <- open_dataset("bases/eph_combinada_2003_2025") |>
   select(all_of(cols_necesarias)) |>
-  filter(ANO4 %in% 2016:2025) |>
+  filter(ANO4 %in% 2003:2025) |>
   collect()
 
 # replicamos las exclusiones que hace INDEC, es decir,
@@ -33,7 +33,20 @@ base <- base |> filter(
   !(ANO4 == 2020 & TRIMESTRE %in% c(3, 4) & AGLOMERADO == 31)
 )
 
-canastas <- read_parquet("bases/canastas_regionales.parquet")
+# fallback de pesos: en los años de la intervención (~2007-2015) la EPH continua
+# no trae PONDIH/PONDIIO (la columna viene NA entera), sólo PONDERA. Sólo donde
+# falta (NA) usamos PONDERA. OJO: NO tocamos los ceros: PONDIH==0 es la marca de
+# INDEC para "excluir de pobreza por ingresos" (no respuesta de ingresos) y
+# calculate_poverty la usa para poner situacion=NA. Si reemplazáramos esos ceros
+# por PONDERA volveríamos a contar a ~25% de la gente (más pobre en promedio) y
+# la tasa salta ~15pp por encima de INDEC. (decisión: serie continua con PONDERA)
+base <- base |> mutate(
+  PONDIH  = if_else(is.na(PONDIH),  as.numeric(PONDERA), PONDIH),
+  PONDIIO = if_else(is.na(PONDIIO), as.numeric(PONDERA), PONDIIO)
+)
+
+# canasta combinada: CEPED (Canastas.xlsx) 2003-2016 + INDEC/eph 2017-2025
+canastas <- read_parquet("bases/canastas_combinadas.parquet")
 
 canastas_q <- canastas |>
   distinct(periodo) |>
@@ -127,7 +140,7 @@ brecha_long <- read_excel("bases/Estimación brecha ANR_20260416.xlsx", #cortes�
   pivot_longer(-percentil, names_to = "col", values_to = "brecha") |>
   mutate(ANO4 = as.integer(substr(col, 1, 4)),
          metodo = substr(col, 11, 11)) |>
-  filter(metodo == "c", ANO4 %in% 2016:2025) |>
+  filter(metodo == "c", ANO4 %in% 2003:2025) |>
   transmute(ANO4, percentil,
             brecha_aplicada = if_else(brecha > 1, brecha, 1))
 

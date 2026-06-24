@@ -9,6 +9,7 @@ library(ggrepel)
 library(ggiraph)
 library(patchwork)
 library(DT)
+library(gt)
 
 # Carga de datos ####
 
@@ -25,11 +26,26 @@ datos    <- read_parquet(file.path(ruta_bases, "datos_app_densidades.parquet"))
 umbrales <- read_parquet(file.path(ruta_bases, "umbrales_brecha_por_trimestre.parquet"))
 hogares_mejor <- read_parquet(file.path(ruta_bases, "hogares_que_mejoraron.parquet"))
 pobreza_serie <- read_parquet(file.path(ruta_bases, "pobreza_serie.parquet"))
+ecdf_pob      <- read_parquet(file.path(ruta_bases, "datos_app_ecdf_pobreza.parquet"))
+sensib        <- read_parquet(file.path(ruta_bases, "sensibilidad_lineas_serie.parquet"))
+dist_serie    <- read_parquet(file.path(ruta_bases, "distribucion_ingreso_serie.parquet"))
+dist_lorenz   <- read_parquet(file.path(ruta_bases, "distribucion_ingreso_lorenz.parquet"))
+dist_deciles  <- read_parquet(file.path(ruta_bases, "distribucion_ingreso_deciles.parquet"))
 
 # para los gráficos de semestrales (lo mismo de 03_graficos_pobreza_ajustada,R)
 sem_label_fn <- function(x) {
   ano <- floor(x); sem <- round((x - ano) * 2) + 1
   sprintf("S%d %d", sem, ano)
+}
+
+# un tick por año en el eje x (centrado en los semestres presentes de ese año),
+# para etiquetar los paneles de la pestaña "Tasa de pobreza" con el año en vez
+# del semestre, que amontonaba demasiado
+anio_breaks_labels <- function(periodos) {
+  data.frame(periodo = sort(unique(periodos))) |>
+    mutate(anio = floor(periodo)) |>
+    group_by(anio) |>
+    summarise(at = mean(periodo), .groups = "drop")
 }
 
 # regla de Scott con sd ponderada y tamaño muestral para el tamaño de los bins, igual no entiendo tanto
@@ -110,12 +126,6 @@ delta_bars <- delta_grupo_sem |>
 
 delta_inside_lbl <- delta_bars |> filter(share >= 0.05)
 
-# etiquetas a la derecha de la última barra pero quedan feas, las voy a sacar creo
-delta_labels_last <- delta_grupo_sem |>
-  filter(periodo == max(periodo)) |>
-  arrange(desc(as.integer(grupo))) |>
-  mutate(ymid = cumsum(share) - share / 2)
-
 # misma descomposición pero solo contando los hogares que salieron de la pobreza
 # lo cual es mucho más interesante
 delta_grupo_sem_lp <- datos |>
@@ -141,6 +151,41 @@ delta_bars_lp <- delta_grupo_sem_lp |>
   mutate(xmin = periodo - 0.275, xmax = periodo + 0.275)
 
 delta_inside_lbl_lp <- delta_bars_lp |> filter(share >= 0.05)
+
+# pestaña "Distribución del ingreso" ####
+
+# colores compartidos con el resto del repo
+col_orig     <- "#1f78b4"
+col_aj       <- "#e31a1c"
+color_barras <- "#41b6c4"
+
+# cambio % del ingreso medio por categoría ocupacional y semestre (heatmap).
+# se calcula acá, igual que el 06, a partir de datos_app_densidades.
+cat_occ <- datos |>
+  filter(!is.na(ingreso), ingreso > 0, !is.na(peso_ingreso), peso_ingreso > 0) |>
+  mutate(SEMESTRE = if_else(TRIMESTRE %in% c(1L, 2L), 1L, 2L)) |>
+  group_by(ANO4, SEMESTRE, grupo) |>
+  summarise(media_antes   = weighted.mean(ingreso,      peso_ingreso),
+            media_despues = weighted.mean(ingreso_post, peso_ingreso),
+            .groups = "drop") |>
+  mutate(cambio_pct  = media_despues / media_antes - 1,
+         periodo     = ANO4 + (SEMESTRE - 1) * 0.5,
+         periodo_lbl = sem_label_fn(periodo))
+
+orden_grupos_occ <- cat_occ |>
+  group_by(grupo) |>
+  summarise(m = mean(cambio_pct, na.rm = TRUE), .groups = "drop") |>
+  arrange(m) |> pull(grupo)
+
+cat_occ <- cat_occ |>
+  mutate(grupo = factor(grupo, levels = orden_grupos_occ),
+         periodo_lbl = factor(periodo_lbl,
+                              levels = sem_label_fn(sort(unique(periodo)))))
+
+# semestres disponibles para el selector de Lorenz / deciles
+periodos_dist <- dist_lorenz |>
+  distinct(periodo) |> arrange(periodo) |>
+  mutate(lbl = sem_label_fn(periodo)) |> pull(lbl)
 
 # interfaz usuaria pero acá estoy flojo de papeles
 
@@ -261,6 +306,132 @@ ui <- page_navbar(
         plotOutput("plot_cmp", height = "600px")
       )
     )
+  ),
+
+  nav_panel(
+    "Pobreza: ITF / CBT",
+    layout_sidebar(
+      sidebar = sidebar(
+        width = 320,
+
+        selectInput("periodo_pob", "Trimestre:",
+                    choices  = periodos,
+                    selected = periodos[length(periodos)]),
+
+        helpText(tags$small(
+          "ECDF del ingreso total familiar por adulto equivalente (ITF / adequí ",
+          "del hogar), expresado en múltiplos de la Canasta Básica Total del hogar, ",
+          "antes y después del ajuste por subdeclaración. Una fila por persona, ",
+          "ponderada por PONDIH. La línea roja punteada en 1 es la CBT: a su ",
+          "izquierda quedan las personas pobres, a su derecha las no pobres."
+        ))
+      ),
+
+      card(
+        full_screen = TRUE,
+        card_header("ECDF de ITF por adulto equivalente / CBT del hogar — antes vs. después"),
+        plotOutput("plot_ecdf_pob", height = "620px")
+      ),
+
+      card(
+        card_header("Personas bajo la línea de pobreza"),
+        textOutput("info_pob_ecdf")
+      )
+    )
+  ),
+
+  nav_panel(
+    "Sensibilidad",
+    layout_sidebar(
+      sidebar = sidebar(
+        width = 320,
+
+        radioButtons("escenario_sensib", "Escenario:",
+          choices = c("% Ajustada (post-subdeclaración)" = "hc_aj",
+                      "% Original"                        = "hc_orig",
+                      "Δ pp (ajustada − original)"        = "delta_pp"),
+          selected = "hc_aj"),
+
+        helpText(tags$small(
+          "% de personas con ingreso del hogar (ITF) por debajo de cada múltiplo ",
+          "de la línea de pobreza (k·CBT del hogar), por semestre. 1 LP = línea ",
+          "oficial (resaltada). Δ pp negativo = el ajuste baja la pobreza en ese umbral."
+        ))
+      ),
+
+      card(
+        full_screen = TRUE,
+        card_header("Pobreza bajo distintos múltiplos de la línea — original vs ajustada"),
+        gt_output("tabla_sensib")
+      )
+    )
+  ),
+
+  nav_panel(
+    "Distribución del ingreso",
+    navset_card_tab(
+      full_screen = TRUE,
+      title = "Efecto del ajuste sobre la distribución del ingreso (IPCF, ponderado por PONDIH)",
+
+      nav_panel(
+        "Gini",
+        plotOutput("dist_gini", height = "620px"),
+        helpText(tags$small(
+          "Coeficiente de Gini del ingreso per cápita familiar, original vs ajustado. ",
+          "Las barras son el Δ Gini (eje derecho): Δ > 0 ⇒ el ajuste aumenta la desigualdad medida."
+        ))
+      ),
+
+      nav_panel(
+        "Media y mediana",
+        plotOutput("dist_media_mediana", height = "620px"),
+        helpText(tags$small(
+          "Variación % del IPCF entre el escenario ajustado y el original, por semestre. ",
+          "Media > mediana ⇒ el ajuste se concentra en la parte alta de la distribución."
+        ))
+      ),
+
+      nav_panel(
+        "Brecha D10/D1",
+        plotOutput("dist_brecha", height = "620px"),
+        helpText(tags$small(
+          "Cociente entre el IPCF medio del decil más rico y el del más pobre, ",
+          "original vs ajustado. Deciles re-rankeados dentro de cada escenario."
+        ))
+      ),
+
+      nav_panel(
+        "Por categoría",
+        plotOutput("dist_categoria", height = "620px"),
+        helpText(tags$small(
+          "Cambio % del ingreso individual medio (laboral o jubilatorio) por categoría ",
+          "ocupacional y semestre. Más oscuro = el ajuste lo sube más."
+        ))
+      ),
+
+      nav_panel(
+        "Lorenz y deciles",
+        layout_sidebar(
+          sidebar = sidebar(
+            width = 300,
+            selectInput("periodo_dist", "Semestre:",
+                        choices  = periodos_dist,
+                        selected = periodos_dist[length(periodos_dist)]),
+            helpText(tags$small(
+              "Curva de Lorenz y participación en el ingreso total por decil de IPCF, ",
+              "antes y después del ajuste, para el semestre elegido."
+            ))
+          ),
+          layout_columns(
+            col_widths = c(6, 6),
+            card(card_header("Curva de Lorenz"),
+                 plotOutput("dist_lorenz", height = "560px")),
+            card(card_header("Participación por decil"),
+                 plotOutput("dist_deciles", height = "560px"))
+          )
+        )
+      )
+    )
   )
 )
 
@@ -274,32 +445,46 @@ server <- function(input, output, session) {
     tot_s <- pobreza_serie
 
     color_barras <- "#41b6c4"
-    col_orig <- "#1f78b4"; col_aj <- "#e31a1c"; col_indec <- "#33a02c"
+    col_orig <- "#1f78b4"; col_aj <- "#e31a1c"
+    col_indec <- "#33a02c"; col_indec_hist <- "#6a3d9a"
 
     max_tasa     <- max(c(tot_s$pobreza_original, tot_s$tasa_indec), na.rm = TRUE)
     max_delta    <- max(tot_s$delta_pp)
-    scale_factor <- (max_tasa * 0.18) / max_delta
+    scale_factor <- (max_tasa * 0.16) / max_delta
 
-    df_long <- tot_s |>
-      select(ANO4, SEMESTRE, periodo,
-             pobreza_original, pobreza_ajustada, tasa_indec) |>
-      pivot_longer(c(pobreza_original, pobreza_ajustada, tasa_indec),
-                   names_to = "tipo", values_to = "tasa") |>
-      mutate(tipo = recode(tipo,
-                           pobreza_original = "Original",
-                           pobreza_ajustada = "Ajustada",
-                           tasa_indec       = "INDEC oficial"),
-             tipo = factor(tipo, levels = c("Original", "Ajustada", "INDEC oficial"))) |>
+    # serie oficial partida en hist (2003-06, otra canasta) y vigente (2016+): son
+    # tipos distintos para que geom_line no los una cruzando la intervención, que
+    # queda excluida (indec_grupo == "intervencion", valores subdeclarados).
+    df_lines <- bind_rows(
+      tot_s |> transmute(ANO4, SEMESTRE, periodo, tasa = pobreza_original, tipo = "Original"),
+      tot_s |> transmute(ANO4, SEMESTRE, periodo, tasa = pobreza_ajustada, tipo = "Ajustada"),
+      tot_s |> filter(indec_grupo == "hist")   |> transmute(ANO4, SEMESTRE, periodo, tasa = tasa_indec, tipo = "INDEC 2003-06"),
+      tot_s |> filter(indec_grupo == "actual") |> transmute(ANO4, SEMESTRE, periodo, tasa = tasa_indec, tipo = "INDEC oficial")
+    ) |>
+      mutate(tipo = factor(tipo, levels = c("Original", "Ajustada", "INDEC oficial", "INDEC 2003-06"))) |>
       filter(!is.na(tasa))
 
+    gap_xmin <- 2015.25; gap_xmax <- 2016.25
+
+    # mismos breaks de año para los tres paneles (comparten los 42 semestres)
+    brks_anio <- anio_breaks_labels(tot_s$periodo)
+
     g <- ggplot() +
+      annotate("rect", xmin = gap_xmin, xmax = gap_xmax, ymin = -Inf, ymax = Inf,
+               fill = "grey88", alpha = 0.6) +
+      annotate("text", x = (gap_xmin + gap_xmax) / 2, y = max_tasa * 0.55,
+               label = "apagón\nestadístico\n2015–2016", size = 2.6,
+               color = "grey45", fontface = "italic", lineheight = 0.9) +
+      annotate("text", x = 2010.5, y = max_tasa * 0.9,
+               label = "Intervención del INDEC: serie oficial\nintervenida (subdeclarada), no se grafica",
+               size = 3, color = "grey45", fontface = "italic", lineheight = 0.95) +
       geom_col_interactive(
         data = tot_s,
         aes(periodo, delta_pp * scale_factor,
             tooltip = sprintf("S%d %d · Δ ajuste = %.2f pp",
                               SEMESTRE, ANO4, delta_pp),
             data_id = as.character(periodo)),
-        fill = color_barras, color = NA, width = 0.10, alpha = 0.85
+        fill = color_barras, color = NA, width = 0.16, alpha = 0.85
       ) +
       geom_text_repel(
         data = tot_s,
@@ -308,11 +493,11 @@ server <- function(input, output, session) {
         color = color_barras, size = 3.2, fontface = "bold",
         nudge_y = 0.008, direction = "y", min.segment.length = Inf, seed = 3
       ) +
-      geom_line(data = df_long,
+      geom_line(data = df_lines,
                 aes(periodo, tasa, color = tipo, linetype = tipo),
                 linewidth = 0.7) +
       geom_point_interactive(
-        data = df_long,
+        data = df_lines,
         aes(periodo, tasa, color = tipo,
             tooltip = sprintf("S%d %d · %s: %s",
                               SEMESTRE, ANO4, tipo,
@@ -321,25 +506,32 @@ server <- function(input, output, session) {
         size = 1.9
       ) +
       geom_text_repel(
-        data = df_long |> filter(tipo == "Original"),
+        data = df_lines |> filter(tipo == "Original"),
         aes(periodo, tasa, label = label_percent(accuracy = 0.1)(tasa)),
         color = col_orig, size = 3.2,
         nudge_y = 0.020, direction = "y", min.segment.length = 0,
         segment.size = 0.2, segment.alpha = 0.4, seed = 1
       ) +
       geom_text_repel(
-        data = df_long |> filter(tipo == "Ajustada"),
+        data = df_lines |> filter(tipo == "Ajustada"),
         aes(periodo, tasa, label = label_percent(accuracy = 0.1)(tasa)),
         color = col_aj, size = 3.2,
         nudge_y = -0.020, direction = "y", min.segment.length = 0,
         segment.size = 0.2, segment.alpha = 0.4, seed = 2
       ) +
       geom_text_repel(
-        data = df_long |> filter(tipo == "INDEC oficial"),
+        data = df_lines |> filter(tipo == "INDEC oficial"),
         aes(periodo, tasa, label = label_percent(accuracy = 0.1)(tasa)),
         color = col_indec, size = 2.8, fontface = "italic",
         nudge_y = 0.038, direction = "y", min.segment.length = 0,
         segment.size = 0.2, segment.alpha = 0.4, seed = 4
+      ) +
+      geom_text_repel(
+        data = df_lines |> filter(tipo == "INDEC 2003-06"),
+        aes(periodo, tasa, label = label_percent(accuracy = 0.1)(tasa)),
+        color = col_indec_hist, size = 2.8, fontface = "italic",
+        nudge_y = -0.030, direction = "y", min.segment.length = 0,
+        segment.size = 0.2, segment.alpha = 0.4, seed = 5
       ) +
       scale_y_continuous(
         labels = label_percent(accuracy = 1),
@@ -348,21 +540,20 @@ server <- function(input, output, session) {
                             labels = label_number(accuracy = 0.1))
       ) +
       scale_x_continuous(
-        breaks = sort(unique(tot_s$periodo)),
-        labels = sem_label_fn
+        breaks = brks_anio$at,
+        labels = as.character(brks_anio$anio)
       ) +
       scale_color_manual(values = c(Original = col_orig, Ajustada = col_aj,
-                                    "INDEC oficial" = col_indec)) +
+                                    "INDEC oficial" = col_indec,
+                                    "INDEC 2003-06" = col_indec_hist)) +
       scale_linetype_manual(values = c(Original = "solid", Ajustada = "dashed",
-                                       "INDEC oficial" = "dotdash")) +
-      expand_limits(x = max(delta_grupo_sem$periodo) + 1.4) +
+                                       "INDEC oficial" = "dotdash",
+                                       "INDEC 2003-06" = "dotdash")) +
       labs(x = NULL, y = "Tasa de pobreza",
            color = NULL, linetype = NULL) +
       theme_minimal(base_size = 13) +
       theme(legend.position = "top",
             panel.grid.minor = element_blank(),
-            axis.text.x  = element_blank(),
-            axis.ticks.x = element_blank(),
             axis.title.x = element_blank())
 
     g_share <- ggplot() +
@@ -383,33 +574,19 @@ server <- function(input, output, session) {
         inherit.aes = FALSE,
         color = "white", size = 3, fontface = "bold"
       ) +
-      ggrepel::geom_text_repel(
-        data = delta_labels_last,
-        aes(x = periodo, y = ymid, label = grupo, color = grupo),
-        inherit.aes = FALSE,
-        hjust = 0, nudge_x = 0.35,
-        direction = "y", min.segment.length = 0,
-        segment.size = 0.3, segment.alpha = 0.5,
-        fontface = "bold", size = 3.2,
-        xlim = c(max(delta_grupo_sem$periodo) + 0.3, NA),
-        show.legend = FALSE
-      ) +
       scale_y_continuous(labels = label_percent(accuracy = 1),
                          expand = expansion(mult = c(0, 0.02))) +
       scale_x_continuous(
-        breaks = sort(unique(delta_grupo_sem$periodo)),
-        labels = sem_label_fn
+        breaks = brks_anio$at,
+        labels = as.character(brks_anio$anio)
       ) +
       scale_fill_manual(values = paleta_10, drop = FALSE, guide = "none") +
       scale_color_manual(values = paleta_10, drop = FALSE, guide = "none") +
-      expand_limits(x = max(delta_grupo_sem$periodo) + 1.4) +
       labs(x = NULL, y = "Composición del Δ ITF") +
       theme_minimal(base_size = 13) +
       theme(legend.position = "none",
             panel.grid.minor = element_blank(),
             panel.grid.major.x = element_blank(),
-            axis.text.x  = element_blank(),
-            axis.ticks.x = element_blank(),
             axis.title.x = element_blank())
 
     g_left_poverty <- ggplot() +
@@ -433,18 +610,21 @@ server <- function(input, output, session) {
       scale_y_continuous(labels = label_percent(accuracy = 1),
                          expand = expansion(mult = c(0, 0.02))) +
       scale_x_continuous(
-        breaks = sort(unique(delta_grupo_sem$periodo)),
-        labels = sem_label_fn
+        breaks = brks_anio$at,
+        labels = as.character(brks_anio$anio)
       ) +
-      scale_fill_manual(values = paleta_10, drop = FALSE, guide = "none") +
-      expand_limits(x = max(delta_grupo_sem$periodo) + 1.4) +
+      # leyenda clásica abajo (en vez de las etiquetas ggrepel sobre las barras):
+      # documenta los grupos de los dos paneles apilados sin tapar el diseño
+      scale_fill_manual(values = paleta_10, drop = FALSE,
+                        guide = guide_legend(nrow = 2, byrow = TRUE)) +
       labs(x = NULL, y = "Composición del Δ ITF — hogares que salieron de la pobreza",
+           fill = NULL,
            caption = "Fuentes: EPH continua + brecha MLER/EPH por percentil + Cuadro 1 INDEC. Ponderado por PONDIH (líneas) y peso de ingreso (composición).") +
       theme_minimal(base_size = 13) +
-      theme(legend.position = "none",
+      theme(legend.position = "bottom",
+            legend.title = element_blank(),
             panel.grid.minor = element_blank(),
-            panel.grid.major.x = element_blank(),
-            axis.text.x = element_text(angle = 45, hjust = 1))
+            panel.grid.major.x = element_blank())
 
     combined <- g / g_share / g_left_poverty + plot_layout(heights = c(2.2, 1, 1))
 
@@ -751,6 +931,310 @@ server <- function(input, output, session) {
                               input$grupo_cmp, input$periodo_cmp)) +
       theme_minimal(base_size = 13) +
       theme(legend.position = "top", legend.title = element_blank())
+  })
+
+  # Pestaña: Pobreza ITF / CBT (ECDF del ingreso por adulto equiv. en múltiplos de la CBT)
+
+  # rojo reservado para la línea de la CBT, así que las curvas van en azul/verde
+  paleta_pob <- c("Antes (original)"   = "#1f78b4",
+                  "Después (ajustado)" = "#33a02c")
+
+  ecdf_pob_periodo <- reactive({
+    ecdf_pob |> filter(periodo_lbl == input$periodo_pob)
+  })
+
+  output$plot_ecdf_pob <- renderPlot({
+    d <- ecdf_pob_periodo()
+    if (nrow(d) == 0) return(NULL)
+
+    # piso para que las personas con ITF == 0 (ratio 0) caigan en el extremo
+    # izquierdo del eje log en vez de desaparecer; su masa ya queda contada en
+    # la acumulada porque ordenamos por el ratio original.
+    piso <- 0.05
+
+    ecdf_df <- d |>
+      select(ratio_antes, ratio_despues, PONDIH) |>
+      pivot_longer(c(ratio_antes, ratio_despues),
+                   names_to = "momento", values_to = "ratio") |>
+      mutate(momento = factor(
+        if_else(momento == "ratio_antes", "Antes (original)", "Después (ajustado)"),
+        levels = c("Antes (original)", "Después (ajustado)")
+      )) |>
+      arrange(momento, ratio) |>
+      group_by(momento) |>
+      mutate(cum_w  = cumsum(PONDIH) / sum(PONDIH),
+             x_plot = pmax(ratio, piso)) |>
+      ungroup()
+
+    breaks_x <- c(0.05, 0.1, 0.25, 0.5, 1, 2, 4, 8, 16)
+    labels_x <- c("0", "0,1", "0,25", "0,5", "1", "2", "4", "8", "16")
+
+    ggplot(ecdf_df, aes(x = x_plot, y = cum_w, color = momento)) +
+      annotate("rect", xmin = piso, xmax = 1, ymin = -Inf, ymax = Inf,
+               fill = "#E15759", alpha = 0.07) +
+      geom_step(linewidth = 0.9, alpha = 0.9) +
+      geom_vline(xintercept = 1, linetype = "dashed",
+                 color = "#E15759", linewidth = 0.7) +
+      annotate("text", x = 1, y = 0.03, label = "CBT",
+               color = "#E15759", hjust = -0.18, vjust = 0,
+               fontface = "bold", size = 4.2) +
+      scale_x_log10(breaks = breaks_x, labels = labels_x) +
+      scale_y_continuous(labels = label_percent(), breaks = seq(0, 1, 0.25)) +
+      scale_color_manual(values = paleta_pob) +
+      labs(x = "ITF por adulto equivalente, en múltiplos de la CBT del hogar (escala log)",
+           y = "Acumulada (% de personas ≤ x)",
+           color = NULL,
+           subtitle = sprintf(
+             "Ingreso familiar por adulto equivalente sobre la línea de pobreza — %s",
+             input$periodo_pob)) +
+      theme_minimal(base_size = 13) +
+      theme(legend.position = "top", legend.title = element_blank(),
+            panel.grid.minor = element_blank())
+  })
+
+  output$info_pob_ecdf <- renderText({
+    d <- ecdf_pob_periodo()
+    if (nrow(d) == 0) return("Sin datos para este trimestre.")
+    w  <- sum(d$PONDIH, na.rm = TRUE)
+    pa <- sum(d$PONDIH[d$ratio_antes   < 1], na.rm = TRUE) / w
+    pd <- sum(d$PONDIH[d$ratio_despues < 1], na.rm = TRUE) / w
+    sprintf(
+      "Personas con ITF < CBT del hogar (pobres + indigentes): %s antes → %s después del ajuste (Δ %.1f pp). Población ponderada (PONDIH): %s.",
+      label_percent(accuracy = 0.1)(pa),
+      label_percent(accuracy = 0.1)(pd),
+      (pd - pa) * 100,
+      format(round(w), big.mark = ".", decimal.mark = ",")
+    )
+  })
+
+  # Pestaña: Sensibilidad (tabla gt de pobreza por múltiplo de la línea)
+
+  output$tabla_sensib <- render_gt({
+    metric   <- input$escenario_sensib
+    es_delta <- metric == "delta_pp"
+
+    df <- sensib |>
+      arrange(periodo, k) |>
+      mutate(periodo_lbl = sem_label_fn(periodo)) |>
+      select(periodo, periodo_lbl, k_lbl, valor = all_of(metric)) |>
+      pivot_wider(names_from = k_lbl, values_from = valor) |>
+      arrange(periodo) |>
+      select(-periodo)
+
+    cols_k <- setdiff(names(df), "periodo_lbl")  # "0,5 LP" ... "2 LP", en orden
+
+    g <- df |>
+      gt(rowname_col = "periodo_lbl") |>
+      tab_header(
+        title    = "Sensibilidad de la pobreza al valor de la línea",
+        subtitle = "% de personas con ITF del hogar por debajo de k líneas de pobreza (k·CBT), por semestre"
+      ) |>
+      tab_spanner(label   = "Líneas de pobreza (múltiplos de la CBT del hogar)",
+                  columns = all_of(cols_k)) |>
+      tab_source_note(
+        "Fuente: EPH continua + brecha MLER/EPH por percentil. Ponderado por PONDIH."
+      )
+
+    if (es_delta) {
+      lim <- max(abs(as.matrix(df[cols_k])), na.rm = TRUE)
+      g <- g |>
+        fmt_number(columns = all_of(cols_k), decimals = 1) |>
+        data_color(columns = all_of(cols_k),
+                   palette = c("#2166ac", "white", "#b2182b"),
+                   domain  = c(-lim, lim))
+    } else {
+      g <- g |> fmt_percent(columns = all_of(cols_k), decimals = 1)
+    }
+
+    # resaltar la columna de la línea oficial (1 LP) = "current rate" del cuadro.
+    # en modo Δ el fondo lo pone data_color, así que ahí solo va negrita + encabezado.
+    g <- g |>
+      tab_style(style     = cell_text(weight = "bold"),
+                locations = cells_body(columns = "1 LP")) |>
+      tab_style(style     = list(cell_fill(color = "#41b6c4"),
+                                 cell_text(color = "white", weight = "bold")),
+                locations = cells_column_labels(columns = "1 LP"))
+
+    if (!es_delta) {
+      g <- g |>
+        tab_style(style     = cell_fill(color = "#d8f0f3"),
+                  locations = cells_body(columns = "1 LP"))
+    }
+
+    g |>
+      opt_row_striping() |>
+      tab_options(container.height        = px(720),
+                  table.font.size         = px(13),
+                  data_row.padding        = px(3),
+                  heading.title.font.size = px(16))
+  })
+
+  # Pestaña: Distribución del ingreso
+
+  output$dist_gini <- renderPlot({
+    long <- bind_rows(
+      dist_serie |> transmute(periodo, escenario = "Original", gini = gini_Original),
+      dist_serie |> transmute(periodo, escenario = "Ajustada", gini = gini_Ajustada)
+    ) |>
+      mutate(escenario = factor(escenario, levels = c("Original", "Ajustada")))
+
+    max_g  <- max(long$gini, na.rm = TRUE)
+    max_dg <- max(abs(dist_serie$delta_gini), na.rm = TRUE)
+    fac_g  <- (max_g * 0.18) / max_dg
+
+    ggplot() +
+      geom_col(data = dist_serie, aes(periodo, delta_gini * fac_g),
+               fill = color_barras, color = NA, width = 0.16, alpha = 0.85) +
+      geom_text_repel(data = dist_serie,
+                      aes(periodo, delta_gini * fac_g,
+                          label = sprintf("%+.3f", delta_gini)),
+                      color = color_barras, size = 2.8, fontface = "bold",
+                      nudge_y = max_g * 0.02, direction = "y",
+                      min.segment.length = Inf, seed = 1) +
+      geom_line(data = long, aes(periodo, gini, color = escenario, linetype = escenario),
+                linewidth = 0.7) +
+      geom_point(data = long, aes(periodo, gini, color = escenario), size = 1.9) +
+      geom_text_repel(data = long |> filter(escenario == "Original"),
+                      aes(periodo, gini, label = sprintf("%.3f", gini)),
+                      color = col_orig, size = 2.8, nudge_y = 0.012, direction = "y",
+                      min.segment.length = 0, segment.alpha = 0.4, seed = 2) +
+      geom_text_repel(data = long |> filter(escenario == "Ajustada"),
+                      aes(periodo, gini, label = sprintf("%.3f", gini)),
+                      color = col_aj, size = 2.8, nudge_y = -0.012, direction = "y",
+                      min.segment.length = 0, segment.alpha = 0.4, seed = 3) +
+      scale_y_continuous(
+        sec.axis = sec_axis(~ . / fac_g, name = "Δ Gini (Ajustada − Original)",
+                            labels = label_number(accuracy = 0.001))) +
+      scale_x_continuous(breaks = sort(unique(dist_serie$periodo)), labels = sem_label_fn) +
+      scale_color_manual(values = c(Original = col_orig, Ajustada = col_aj)) +
+      scale_linetype_manual(values = c(Original = "solid", Ajustada = "dashed")) +
+      labs(x = NULL, y = "Coeficiente de Gini", color = NULL, linetype = NULL) +
+      theme_minimal(base_size = 13) +
+      theme(legend.position = "top", panel.grid.minor = element_blank(),
+            axis.text.x = element_text(angle = 45, hjust = 1))
+  })
+
+  output$dist_media_mediana <- renderPlot({
+    cl <- dist_serie |>
+      select(periodo, Media = cambio_media, Mediana = cambio_mediana) |>
+      pivot_longer(c(Media, Mediana), names_to = "estadistico", values_to = "cambio") |>
+      mutate(estadistico = factor(estadistico, levels = c("Media", "Mediana")))
+
+    ggplot(cl, aes(periodo, cambio, color = estadistico, linetype = estadistico)) +
+      geom_line(linewidth = 0.8) +
+      geom_point(size = 2) +
+      geom_text_repel(aes(label = label_percent(accuracy = 0.1)(cambio)),
+                      size = 2.7, show.legend = FALSE, direction = "y",
+                      min.segment.length = 0, segment.alpha = 0.35, seed = 4) +
+      scale_y_continuous(labels = label_percent(accuracy = 0.1)) +
+      scale_x_continuous(breaks = sort(unique(dist_serie$periodo)), labels = sem_label_fn) +
+      scale_color_manual(values = c(Media = col_aj, Mediana = "#6a3d9a")) +
+      scale_linetype_manual(values = c(Media = "solid", Mediana = "dashed")) +
+      labs(x = NULL, y = "Variación %", color = NULL, linetype = NULL) +
+      theme_minimal(base_size = 13) +
+      theme(legend.position = "top", panel.grid.minor = element_blank(),
+            axis.text.x = element_text(angle = 45, hjust = 1))
+  })
+
+  output$dist_brecha <- renderPlot({
+    long <- bind_rows(
+      dist_serie |> transmute(periodo, escenario = "Original", gap = gap_d10_d1_Original),
+      dist_serie |> transmute(periodo, escenario = "Ajustada", gap = gap_d10_d1_Ajustada)
+    ) |>
+      mutate(escenario = factor(escenario, levels = c("Original", "Ajustada")))
+
+    max_b  <- max(long$gap, na.rm = TRUE)
+    max_db <- max(abs(dist_serie$delta_gap), na.rm = TRUE)
+    fac_b  <- (max_b * 0.18) / max_db
+
+    ggplot() +
+      geom_col(data = dist_serie, aes(periodo, delta_gap * fac_b),
+               fill = color_barras, color = NA, width = 0.16, alpha = 0.85) +
+      geom_text_repel(data = dist_serie,
+                      aes(periodo, delta_gap * fac_b,
+                          label = sprintf("%+.1f", delta_gap)),
+                      color = color_barras, size = 2.8, fontface = "bold",
+                      nudge_y = max_b * 0.02, direction = "y",
+                      min.segment.length = Inf, seed = 5) +
+      geom_line(data = long, aes(periodo, gap, color = escenario, linetype = escenario),
+                linewidth = 0.7) +
+      geom_point(data = long, aes(periodo, gap, color = escenario), size = 1.9) +
+      geom_text_repel(data = long |> filter(escenario == "Original"),
+                      aes(periodo, gap, label = sprintf("%.1f", gap)),
+                      color = col_orig, size = 2.8, nudge_y = max_b * 0.03, direction = "y",
+                      min.segment.length = 0, segment.alpha = 0.4, seed = 6) +
+      geom_text_repel(data = long |> filter(escenario == "Ajustada"),
+                      aes(periodo, gap, label = sprintf("%.1f", gap)),
+                      color = col_aj, size = 2.8, nudge_y = -max_b * 0.03, direction = "y",
+                      min.segment.length = 0, segment.alpha = 0.4, seed = 7) +
+      scale_y_continuous(
+        sec.axis = sec_axis(~ . / fac_b, name = "Δ brecha (Ajustada − Original)",
+                            labels = label_number(accuracy = 0.1))) +
+      scale_x_continuous(breaks = sort(unique(dist_serie$periodo)), labels = sem_label_fn) +
+      scale_color_manual(values = c(Original = col_orig, Ajustada = col_aj)) +
+      scale_linetype_manual(values = c(Original = "solid", Ajustada = "dashed")) +
+      labs(x = NULL, y = "Ingreso medio D10 / D1 (veces)", color = NULL, linetype = NULL) +
+      theme_minimal(base_size = 13) +
+      theme(legend.position = "top", panel.grid.minor = element_blank(),
+            axis.text.x = element_text(angle = 45, hjust = 1))
+  })
+
+  output$dist_categoria <- renderPlot({
+    ggplot(cat_occ, aes(periodo_lbl, grupo, fill = cambio_pct)) +
+      geom_tile(color = "white", linewidth = 0.4) +
+      geom_text(aes(label = label_percent(accuracy = 1)(cambio_pct)),
+                size = 2.4, color = "grey15") +
+      scale_fill_gradient(low = "#f7fbff", high = "#08519c",
+                          labels = label_percent(accuracy = 1)) +
+      labs(x = NULL, y = NULL, fill = "Cambio %") +
+      theme_minimal(base_size = 13) +
+      theme(panel.grid = element_blank(),
+            axis.text.x = element_text(angle = 45, hjust = 1),
+            legend.position = "right")
+  })
+
+  periodo_dist_sel <- reactive({
+    ps <- sort(unique(dist_lorenz$periodo))
+    ps[match(input$periodo_dist, sem_label_fn(ps))]
+  })
+
+  output$dist_lorenz <- renderPlot({
+    d <- dist_lorenz |>
+      filter(periodo == periodo_dist_sel()) |>
+      mutate(escenario = factor(escenario, levels = c("Original", "Ajustada")))
+    if (nrow(d) == 0) return(NULL)
+
+    ggplot(d, aes(p, L, color = escenario)) +
+      geom_abline(slope = 1, intercept = 0, linetype = "dotted", color = "grey50") +
+      geom_line(linewidth = 0.9) +
+      scale_x_continuous(labels = label_percent(accuracy = 1)) +
+      scale_y_continuous(labels = label_percent(accuracy = 1)) +
+      scale_color_manual(values = c(Original = col_orig, Ajustada = col_aj)) +
+      coord_equal() +
+      labs(x = "Proporción acumulada de población",
+           y = "Proporción acumulada del ingreso", color = NULL) +
+      theme_minimal(base_size = 13) +
+      theme(legend.position = "top", panel.grid.minor = element_blank())
+  })
+
+  output$dist_deciles <- renderPlot({
+    d <- dist_deciles |>
+      filter(periodo == periodo_dist_sel()) |>
+      mutate(escenario = factor(escenario, levels = c("Original", "Ajustada")))
+    if (nrow(d) == 0) return(NULL)
+
+    ggplot(d, aes(factor(decil), share, fill = escenario)) +
+      geom_col(position = position_dodge(width = 0.8), width = 0.72) +
+      geom_text(aes(label = label_percent(accuracy = 0.1)(share)),
+                position = position_dodge(width = 0.8), vjust = -0.4, size = 2.5,
+                color = "grey25") +
+      scale_y_continuous(labels = label_percent(accuracy = 1),
+                         expand = expansion(mult = c(0, 0.08))) +
+      scale_fill_manual(values = c(Original = col_orig, Ajustada = col_aj)) +
+      labs(x = "Decil de IPCF", y = "Participación en el ingreso total", fill = NULL) +
+      theme_minimal(base_size = 13) +
+      theme(legend.position = "top", panel.grid.minor = element_blank(),
+            panel.grid.major.x = element_blank())
   })
 }
 

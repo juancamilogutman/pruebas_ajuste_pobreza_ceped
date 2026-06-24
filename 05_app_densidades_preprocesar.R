@@ -13,9 +13,9 @@ cols_necesarias <- c(
   "PONDERA", "PONDIIO", "PONDII"
 )
 
-base <- open_dataset("bases/eph_combinada_2016_2025") |>
+base <- open_dataset("bases/eph_combinada_2003_2025") |>
   select(all_of(cols_necesarias)) |>
-  filter(ANO4 %in% 2016:2025) |>
+  filter(ANO4 %in% 2003:2025) |>
   # mismas exclusiones de cobertura INDEC (tierra del fuego en un momento de la pandemia, gran resistencia en cierto semestre)
   filter(
     !(ANO4 == 2019 & TRIMESTRE %in% c(3, 4) & AGLOMERADO == 8),
@@ -23,7 +23,15 @@ base <- open_dataset("bases/eph_combinada_2016_2025") |>
   ) |>
   collect()
 
-canastas_q <- read_parquet("bases/canastas_regionales.parquet") |>
+# fallback de pesos de ingreso a PONDERA sólo donde la columna falta entera (NA,
+# intervención ~2007-2015). NO tocamos los ceros: PONDIIO==0 / PONDII==0 son la
+# marca de INDEC para excluir de las estadísticas de ingreso (no respuesta).
+base <- base |> mutate(
+  PONDIIO = if_else(is.na(PONDIIO), as.numeric(PONDERA), PONDIIO),
+  PONDII  = if_else(is.na(PONDII),  as.numeric(PONDERA), PONDII)
+)
+
+canastas_q <- read_parquet("bases/canastas_combinadas.parquet") |>
   distinct(periodo) |>
   transmute(ANO4 = as.integer(substr(periodo, 1, 4)),
             TRIMESTRE = as.integer(substr(periodo, 6, 6)))
@@ -118,7 +126,7 @@ brecha_long <- read_excel("bases/Estimación brecha ANR_20260416.xlsx", #cortes�
   pivot_longer(-percentil, names_to = "col", values_to = "brecha") |>
   mutate(ANO4 = as.integer(substr(col, 1, 4)),
          tipo_eph = substr(col, 11, 11)) |> # el caracter 11 es p o c segun puntual o continua
-  filter(tipo_eph == "c", ANO4 %in% 2016:2025)
+  filter(tipo_eph == "c", ANO4 %in% 2003:2025)
 
 pct_min <- brecha_long |>
   filter(brecha > 1) |>
@@ -151,13 +159,35 @@ umbrales <- ref |>
 
 write_parquet(umbrales, "bases/umbrales_brecha_por_trimestre.parquet")
 
+# base para la pestaña "Pobreza: ITF / CBT" del shiny: una fila por persona con
+# el ingreso total familiar por adulto equivalente expresado en múltiplos de la
+# Canasta Básica Total del hogar (la línea de pobreza), antes y después del
+# ajuste. Normalizamos por CBT_hogar porque la CBT por adulto equivalente es
+# regional (6 valores por trimestre), así una sola línea vertical en 1 separa
+# pobres de no pobres en todas las regiones. Ponderado por PONDIH (persona).
+ecdf_pobreza <- read_parquet("bases/eph_ajustada_v2.parquet") |>
+  filter(!is.na(ITF), !is.na(ITF_ajustado), CBT_hogar > 0, PONDIH > 0) |>
+  transmute(
+    ANO4        = as.integer(ANO4),
+    TRIMESTRE   = as.integer(TRIMESTRE),
+    periodo_lbl = sprintf("%d-T%d", as.integer(ANO4), TRIMESTRE),
+    ratio_antes   = ITF / CBT_hogar,
+    ratio_despues = ITF_ajustado / CBT_hogar,
+    PONDIH
+  )
+
+write_parquet(ecdf_pobreza, "bases/datos_app_ecdf_pobreza.parquet")
+cat("Guardado bases/datos_app_ecdf_pobreza.parquet (", nrow(ecdf_pobreza), "filas)\n")
+
 app_data <- "app/data"
 
 if (dir.exists(app_data)) {
   archivos_app <- c("datos_app_densidades.parquet",
                     "umbrales_brecha_por_trimestre.parquet",
                     "hogares_que_mejoraron.parquet",
-                    "pobreza_serie.parquet")
+                    "pobreza_serie.parquet",
+                    "datos_app_ecdf_pobreza.parquet",
+                    "sensibilidad_lineas_serie.parquet")  # la genera el 08
   for (f in archivos_app) {
     src <- file.path("bases", f)
     dst <- file.path(app_data, f)

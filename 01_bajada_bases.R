@@ -5,10 +5,15 @@ library(eph)
 library(tidyverse)
 library(arrow)
 
-anio_inicio <- 2016
+anio_inicio <- 2003
 anio_fin    <- 2025
 trimestres  <- 1:4
 output_dir  <- "bases"
+
+# la EPH continua arranca en el 3er trimestre de 2003 (antes era puntual) y hay
+# trimestres que INDEC no publicó: 2003 T1-T2, 2007 T3 (parcial), 2015 T3-T4 y
+# 2016 T1-T2. el tryCatch de descargar_trimestre devuelve NULL en esos casos y
+# el loop los saltea solo, así que no hace falta listarlos a mano.
 
 # se crea el directorio para las bases, que está ignorado entereamente por git en el .gitignore
 
@@ -23,7 +28,11 @@ cerrar_conexiones <- function() {
 }
 
 base_valida <- function(x) {
-  !is.null(x) && is.data.frame(x) && nrow(x) > 0 && "CODUSU" %in% names(x)
+  # exigimos NRO_HOGAR y TRIMESTRE para descartar las bases EPH *puntual* que el
+  # paquete devuelve para 2003 T1-T2 (antes de que arrancara la continua): traen
+  # CODUSU pero no NRO_HOGAR/TRIMESTRE y rompen el join y el resto del pipeline.
+  !is.null(x) && is.data.frame(x) && nrow(x) > 0 &&
+    all(c("CODUSU", "NRO_HOGAR", "TRIMESTRE") %in% names(x))
 }
 
 # para cada trimestre que se descarga lo hacemos con esto
@@ -110,22 +119,53 @@ for (anio in anio_inicio:anio_fin) {
   }
 }
 
-# juntamos toda la base con arrow para no cargar todo en memoria y que crashee
+# juntamos toda la base. ahora que vamos de 2003 a 2025 los esquemas por
+# trimestre son muy heterogéneos (años sin PONDIH/PONDII/PONDIIO, sin IX_TOT,
+# columnas que cambian de tipo entre años), así que unify_schemas de arrow se
+# rompe. en vez de eso nos quedamos sólo con las columnas que usa el pipeline
+# (cols_combinada) y forzamos su tipo por trimestre antes de escribir. Las
+# columnas que falten en un trimestre se rellenan con NA; el fallback a PONDERA
+# para los pesos de ingreso se hace después, en el 02 y el 05.
+
+# superset de columnas que necesitan los scripts 02/04/05
+cols_combinada <- c(
+  "CODUSU", "NRO_HOGAR", "COMPONENTE", "ANO4", "TRIMESTRE", "REGION",
+  "AGLOMERADO", "CH04", "CH06", "CAT_OCUP", "PP07H", "PP07E", "PP04A",
+  "PP04B_COD", "P21", "PP08J1", "PP08J2", "PP08J3", "V2_M", "P47T",
+  "ITF", "IPCF", "IX_TOT", "PONDERA", "PONDIIO", "PONDIH", "PONDII"
+)
+# estas se comparan como texto (CODUSU es id, PP04B_COD es "9700" para serv dom)
+cols_texto <- c("CODUSU", "PP04B_COD")
+
+harmonizar_trimestre <- function(path) {
+  df <- read_parquet(path)
+  faltan <- setdiff(cols_combinada, names(df))
+  for (col in faltan) df[[col]] <- NA      # columna ausente en ese año
+  df <- df[cols_combinada]
+  df |> mutate(
+    across(all_of(cols_texto), as.character),
+    across(all_of(setdiff(cols_combinada, cols_texto)),
+           ~ suppressWarnings(as.numeric(.x)))
+  )
+}
 
 parquet_files <- list.files(output_dir, pattern = "^eph_\\d{4}_t\\d\\.parquet$",
                             full.names = TRUE)
 
 if (length(parquet_files) > 0) {
-  ds <- open_dataset(parquet_files, format = "parquet", unify_schemas = TRUE)
-
-  # directorio para la base combinada (guardamos en varios archivos con arrow)
   dir_bases <- file.path(output_dir, str_glue("eph_combinada_{anio_inicio}_{anio_fin}"))
+  if (dir.exists(dir_bases)) unlink(dir_bases, recursive = TRUE)
+  dir.create(dir_bases, recursive = TRUE)
 
-  ds |> write_dataset(path = dir_bases, format = "parquet")
+  # escribimos un parquet armonizado por trimestre dentro del directorio. todos
+  # comparten esquema, así open_dataset() lo lee sin unify_schemas.
+  for (i in seq_along(parquet_files)) {
+    df <- harmonizar_trimestre(parquet_files[i])
+    write_parquet(df, file.path(dir_bases, sprintf("part-%03d.parquet", i)))
+    rm(df); gc(verbose = FALSE)
+  }
 
-  message(str_glue("Base combinada guardada en: {dir_bases}"))
-  rm(ds)
-  gc()
+  message(str_glue("Base combinada guardada en: {dir_bases} ({length(parquet_files)} trimestres)"))
 } else {
   message("Algo falló, no hay base...")
 }
@@ -207,6 +247,75 @@ if (!is.null(canastas) && file.exists(informe)) {
     message(sprintf("Canastas extendidas con %d filas del informe INDEC (%s)",
                     nrow(nuevo), basename(informe)))
   }
+}
+
+# ============================================================================
+# canasta combinada 2003-2025: usamos las canastas regionales del Excel del
+# CEPED (bases/Canastas.xlsx, CBA/CBT por adulto equivalente, "NM-EMP") para
+# 2003-2016 y las de INDEC/paquete eph para 2017-2025. En el solapamiento de
+# 2016 las dos fuentes coinciden casi al decimal, así que el empalme es limpio.
+# El resto del pipeline (02 y 05) lee este archivo, no canastas_regionales.
+# ============================================================================
+canastas_xlsx_path <- file.path(output_dir, "Canastas.xlsx")
+
+if (file.exists(canastas_xlsx_path) && !is.null(canastas)) {
+
+  # mapeo de las columnas regionales del Excel al nombre/código de región EPH
+  regiones_xlsx <- tibble::tribble(
+    ~suf,    ~region,      ~codigo,
+    "GBA",   "GBA",        1,
+    "Cuyo",  "Cuyo",      42,
+    "NEA",   "Noreste",   41,
+    "NOA",   "Noroeste",  40,
+    "Pamp",  "Pampeana",  43,
+    "Patag", "Patagonia", 44
+  )
+
+  cx <- suppressMessages(
+    readxl::read_excel(canastas_xlsx_path, sheet = "Hoja1", .name_repair = "minimal")
+  )
+  # el Excel viene por posición: año, mes, trimestre, 6 CBA y 6 CBT (GBA, Cuyo,
+  # NEA, NOA, Pamp, Patag). Le ponemos nombres y casteamos todo a numérico.
+  names(cx) <- c("ano", "mes", "trim",
+                 paste0("CBA_", regiones_xlsx$suf),
+                 paste0("CBT_", regiones_xlsx$suf))
+  cx <- cx |> mutate(across(everything(), as.numeric))
+
+  # mensual -> trimestral (promedio de los 3 meses) y a formato largo por región
+  canastas_hist <- cx |>
+    pivot_longer(
+      cols = -c(ano, mes, trim),
+      names_to = c(".value", "suf"),
+      names_sep = "_"
+    ) |>
+    group_by(ano, trim, suf) |>
+    summarise(CBA = mean(CBA, na.rm = TRUE),
+              CBT = mean(CBT, na.rm = TRUE), .groups = "drop") |>
+    inner_join(regiones_xlsx, by = "suf") |>
+    transmute(region, periodo = sprintf("%d.%d", ano, trim), CBA, CBT, codigo)
+
+  # cortamos el histórico del Excel en 2016 y pegamos INDEC/eph de 2017 en adelante.
+  # Leemos canastas_regionales.parquet del disco (no el objeto `canastas` en
+  # memoria) porque ese archivo ya tiene la extensión con el informe INDEC, que
+  # agrega los trimestres recientes que el cache de holatam todavía no trae.
+  anios_hist <- as.integer(substr(canastas_hist$periodo, 1, 4))
+  canastas_recientes <- read_parquet(
+      file.path(output_dir, "canastas_regionales.parquet")) |>
+    filter(as.integer(substr(periodo, 1, 4)) >= 2017)
+
+  canastas_comb <- bind_rows(
+    canastas_hist |> filter(anios_hist <= 2016),
+    canastas_recientes
+  ) |>
+    arrange(periodo, region)
+
+  write_parquet(canastas_comb,
+                file.path(output_dir, "canastas_combinadas.parquet"))
+  message(sprintf(
+    "Canastas combinadas 2003-2025 guardadas (%d filas, %s a %s).",
+    nrow(canastas_comb), min(canastas_comb$periodo), max(canastas_comb$periodo)))
+} else {
+  message("No se pudo armar la canasta combinada (falta Canastas.xlsx o las canastas eph).")
 }
 
 message("Proceso finalizado.")
